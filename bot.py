@@ -131,6 +131,13 @@ TOOLS = {
     "sticker": ("🏷 Make sticker (512px)", None),
     "pdf": ("📄 Convert to PDF", None),
     "watermark": ("💧 Add text watermark", None),
+    "crop": ("✂️ Crop (custom size)", None),
+    "sepia": ("🟤 Sepia", None),
+    "posterize": ("🎨 Posterize", [("Strong", "2"), ("Medium", "3"), ("Light", "4")]),
+    "border": ("🖼 Add Border", [("Black", "black"), ("White", "white"), ("Gold", "gold")]),
+    "round": ("⭕ Round Corners", None),
+    "mirror4": ("🪞 Mirror Collage", None),
+    "info": ("ℹ️ Image Info", None),
 }
 
 
@@ -145,19 +152,35 @@ def flat(img):
 
 
 def add_watermark(img, text):
+    """Tiled, semi-transparent, diagonal watermark that covers the ENTIRE image
+    (like a stock-photo watermark), not just one small corner label."""
     img = img.convert("RGBA")
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    size = max(16, img.width // 18)
+    size = max(14, min(img.size) // 16)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", size)
     except OSError:
         font = ImageFont.load_default()
-    box = d.textbbox((0, 0), text, font=font)
-    w, h = box[2] - box[0], box[3] - box[1]
-    x, y = img.width - w - 20, img.height - h - 20
-    d.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 140))
-    d.text((x, y), text, font=font, fill=(255, 255, 255, 210))
+
+    tmp = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    box = ImageDraw.Draw(tmp).textbbox((0, 0), text, font=font)
+    tw, th = box[2] - box[0], box[3] - box[1]
+
+    pad = max(20, int(max(tw, th) * 0.3))
+    stamp = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(stamp)
+    sd.text((pad, pad), text, font=font, fill=(255, 255, 255, 110))
+    stamp = stamp.rotate(-30, expand=True, resample=Image.BICUBIC)
+    sw, sh = stamp.size
+
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    step_x, step_y = int(sw * 0.7), int(sh * 0.55)
+    row = 0
+    for y in range(-sh, img.height + sh, step_y):
+        offset = (step_x // 2) if row % 2 else 0
+        for x in range(-sw + offset, img.width + sw, step_x):
+            layer.alpha_composite(stamp, (x, y))
+        row += 1
+
     return Image.alpha_composite(img, layer)
 
 
@@ -215,6 +238,38 @@ def process(data: bytes, tool: str, opt: str = "", text: str = ""):
     elif tool == "watermark":
         img = add_watermark(img, text)
         fmt, ext = "PNG", "png"
+    elif tool == "crop":
+        w, h = (int(x) for x in opt.split("x"))
+        w, h = min(w, img.width), min(h, img.height)
+        left, top = (img.width - w) // 2, (img.height - h) // 2
+        img = img.crop((left, top, left + w, top + h))
+    elif tool == "sepia":
+        g = ImageOps.grayscale(flat(img))
+        img = ImageOps.colorize(g, black="#3f2d16", white="#ffe9c4")
+    elif tool == "posterize":
+        img = ImageOps.posterize(flat(img).convert("RGB"), int(opt))
+    elif tool == "border":
+        colors = {"black": "#000000", "white": "#ffffff", "gold": "#d4af37"}
+        img = flat(img)
+        th = max(8, min(img.size) // 30)
+        img = ImageOps.expand(img, border=th, fill=colors[opt])
+    elif tool == "round":
+        img = img.convert("RGBA")
+        mask = Image.new("L", img.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, img.width - 1, img.height - 1], radius=min(img.size) // 10, fill=255)
+        img.putalpha(mask)
+        fmt, ext = "PNG", "png"
+    elif tool == "mirror4":
+        img = flat(img).convert("RGB")
+        top = Image.new("RGB", (img.width * 2, img.height))
+        top.paste(img, (0, 0))
+        top.paste(ImageOps.mirror(img), (img.width, 0))
+        bottom = ImageOps.flip(top)
+        canvas = Image.new("RGB", (img.width * 2, img.height * 2))
+        canvas.paste(top, (0, 0))
+        canvas.paste(bottom, (0, img.height))
+        img = canvas
 
     if fmt == "JPEG":
         img = flat(img)
@@ -230,6 +285,8 @@ PROMPTS = {
     "watermark": "✍️ Send the watermark text now:",
     "compress": "🗜 Send quality from <b>1</b> (smallest) to <b>95</b> (best). Example: <code>35</code>",
     "rotate": "🔃 Send the angle in degrees. Example: <code>45</code> or <code>-30</code>",
+    "crop": ("✂️ Send the crop size as <b>WIDTHxHEIGHT</b> in pixels (cropped from the center).\n"
+             "Example: <code>500x500</code>"),
 }
 
 
@@ -248,6 +305,12 @@ def parse_input(tool, text):
         if tool == "rotate":
             a = float(t)
             return str(a) if -360 <= a <= 360 else None
+        if tool == "crop":
+            m = re.fullmatch(r"(\d{1,5})x(\d{1,5})", t)
+            if not m:
+                return None
+            w, h = int(m[1]), int(m[2])
+            return f"{w}x{h}" if w >= 1 and h >= 1 else None
     except ValueError:
         return None
     return None
@@ -302,20 +365,32 @@ async def run_tool(update, context, tool, opt="", text=""):
     ud = context.user_data
     msg = update.effective_message
     if "file_id" not in ud:
-        await msg.reply_text("Please send an image first.")
+        await msg.reply_html("⚠️ No image found. Please send a photo first, then choose a tool.")
         return
     wait = await msg.reply_text("⏳ Processing...")
     try:
         f = await context.bot.get_file(ud["file_id"])
         data = bytes(await f.download_as_bytearray())
+        if tool == "info":
+            im = Image.open(io.BytesIO(data))
+            info = (f"ℹ️ <b>Image info</b>\n"
+                    f"📐 Size: {im.width} x {im.height} px\n"
+                    f"🗂 Format: {im.format}\n"
+                    f"🎨 Mode: {im.mode}\n"
+                    f"📦 File size: {fmt_size(len(data))}")
+            await msg.reply_html(info, reply_markup=tools_kb())
+            return
         out, name = await asyncio.to_thread(process, data, tool, opt, text)
         cap = f"✅ {TOOLS[tool][0]}\n📦 {fmt_size(len(data))} → {fmt_size(len(out))}"
         await context.bot.send_document(msg.chat_id, io.BytesIO(out), filename=name, caption=cap)
         await msg.reply_text("Choose another tool for the same image, or send a new one 👇",
                              reply_markup=tools_kb())
+    except (ValueError, KeyError, OSError) as e:
+        await msg.reply_html(f"❌ <b>Couldn't process that.</b>\nReason: {e}\n\nTry again or send /start.")
     except Exception as e:
         log.exception("process failed")
-        await msg.reply_text(f"❌ Failed: {e}")
+        await msg.reply_html("❌ <b>Something went wrong</b> while processing your image.\n"
+                             "Please try again, or send /start to restart.")
     finally:
         await wait.delete()
 
@@ -359,7 +434,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tool = context.user_data.get("await")
     if not tool:
-        return await update.message.reply_text("Send me a photo 📷")
+        return await update.message.reply_html(
+            "❓ <b>I didn't understand that.</b>\n\n"
+            "📷 Send me a photo (or a file) to use the image tools.\n"
+            "ℹ️ Send /start to see the welcome message again.")
     if tool == "watermark":
         context.user_data.pop("await")
         return await run_tool(update, context, "watermark", text=update.message.text[:60])
@@ -598,6 +676,25 @@ async def admin_input(update, context):
     raise ApplicationHandlerStop
 
 
+async def unknown_command(update, context):
+    if not await gate(update, context):
+        return
+    await update.message.reply_html(
+        "❓ <b>Unknown command.</b>\n\n"
+        "📷 Send me a photo to see the available tools.\n"
+        "ℹ️ Send /start for help.")
+
+
+async def error_handler(update, context):
+    log.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_html(
+                "⚠️ <b>Something went wrong.</b>\nPlease try again, or send /start.")
+        except TelegramError:
+            pass
+
+
 async def cancel(update, context):
     context.user_data.pop("admin_await", None)
     context.user_data.pop("await", None)
@@ -691,6 +788,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    app.add_error_handler(error_handler)
     log.info("Bot started | DB: %s | channels saved: %d", os.path.abspath(DB_PATH), len(get_channels()))
     app.run_polling()
 
